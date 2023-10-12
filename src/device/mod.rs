@@ -7,5 +7,6 @@ pub mod gpu;
 pub mod input;
 pub mod net;
 pub mod socket;
+pub mod v9p;
 
 pub(crate) mod common;
