@@ -6,7 +6,7 @@ use crate::transport::Transport;
 use bitflags::bitflags;
 use core::result::Result;
 use zerocopy::AsBytes;
-use log;
+use log::*;
 
 const UNDEFINED_ERROR: u8 = 0;
 const QUEUE: u16 = 0;
@@ -27,7 +27,7 @@ impl<H: Hal, T: Transport> VirtIO9p<H, T> {
     pub fn new(mut transport: T) -> Result<Self, u8> {
         transport.begin_init(|features| {
             let features = Feature::from_bits_truncate(features);
-            log::info!("device features: {:?}", features);
+            info!("device features: {:?}", features);
             // negotiate these flags only
             let supported_features = Feature::empty();
             (features & supported_features).bits()
@@ -50,7 +50,7 @@ impl<H: Hal, T: Transport> VirtIO9p<H, T> {
     /// if Ok, it will return Ok with the length of response
     /// or it will return Err(0)
     pub fn request(&mut self, request: &[u8], response: &mut [u8]) -> Result<u32, u8> {
-        log::debug!("{:?}", request);
+        trace!("{:?}", request);
         let enqueue_try = self.queue.add_notify_wait_pop(
             &[&request.as_bytes()],
             &mut [response.as_bytes_mut()],
