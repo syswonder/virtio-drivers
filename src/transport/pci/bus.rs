@@ -225,7 +225,6 @@ impl<C: ConfigurationAccess> PciRoot<C> {
         if command_disable_decode != command_orig {
             self.set_command(device_function, command_disable_decode);
         }
-
         let bar_orig = self
             .configuration_access
             .read_word(device_function, BAR0_OFFSET + 4 * bar_index);
@@ -287,9 +286,12 @@ impl<C: ConfigurationAccess> PciRoot<C> {
             self.set_command(device_function, command_orig);
         }
 
-        if size_mask == 0 {
-            Ok(None)
-        } else if io_space {
+        //TODO: PCI devices of RuxOS may report a BAR size of 0,
+        // Uncommenting the following check would cause valid devices to be ignored and the system to fail.
+        // if size_mask == 0 {
+        //     Ok(None)
+        // } else 
+        if io_space {
             // I/O space
             let address = bar_orig & 0xfffffffc;
             Ok(Some(BarInfo::IO {
