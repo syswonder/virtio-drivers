@@ -11,6 +11,7 @@ use core::{
 use log::warn;
 use safe_mmio::{fields::ReadPureWrite, UniqueMmioPointer};
 use thiserror::Error;
+use log::{info,debug};
 
 const INVALID_READ: u32 = 0xffffffff;
 
@@ -219,13 +220,14 @@ impl<C: ConfigurationAccess> PciRoot<C> {
         device_function: DeviceFunction,
         bar_index: u8,
     ) -> Result<Option<BarInfo>, PciError> {
+        debug!("lhw debug virtio bus bar_info device_function: {:?} bar_index: {}", device_function, bar_index);
         // Disable address decoding while sizing the BAR.
         let (_status, command_orig) = self.get_status_command(device_function);
         let command_disable_decode = command_orig & !(Command::IO_SPACE | Command::MEMORY_SPACE);
         if command_disable_decode != command_orig {
             self.set_command(device_function, command_disable_decode);
         }
-
+        debug!("lhw debug virtio2 {:x}",BAR0_OFFSET + 4 * bar_index);
         let bar_orig = self
             .configuration_access
             .read_word(device_function, BAR0_OFFSET + 4 * bar_index);
@@ -241,6 +243,7 @@ impl<C: ConfigurationAccess> PciRoot<C> {
             self.configuration_access
                 .read_word(device_function, BAR0_OFFSET + 4 * bar_index),
         );
+        info!("lhw debug virtio bus size_mask {}", size_mask);
 
         // Read the upper 32 bits of 64-bit memory BARs.
         let (address_top, size_top) = if bar_orig & 0b111 == 0b100 {
@@ -287,9 +290,10 @@ impl<C: ConfigurationAccess> PciRoot<C> {
             self.set_command(device_function, command_orig);
         }
 
-        if size_mask == 0 {
-            Ok(None)
-        } else if io_space {
+        // if size_mask == 0 {
+        //     Ok(None)
+        // } else 
+        if io_space {
             // I/O space
             let address = bar_orig & 0xfffffffc;
             Ok(Some(BarInfo::IO {
@@ -393,6 +397,7 @@ impl MmioCam<'_> {
 impl ConfigurationAccess for MmioCam<'_> {
     fn read_word(&self, device_function: DeviceFunction, register_offset: u8) -> u32 {
         let address = self.cam.cam_offset(device_function, register_offset);
+        // info!("lhw debug virtio bus read_word address: {:#010x} {:X}", address, register_offset);
         // Right shift to convert from byte offset to word offset.
         self.mmio
             .deref()

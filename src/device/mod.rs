@@ -12,6 +12,8 @@ pub mod net;
 
 pub mod rng;
 
+pub mod v9p;
+
 pub mod socket;
 #[cfg(feature = "alloc")]
 pub mod sound;
