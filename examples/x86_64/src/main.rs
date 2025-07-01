@@ -18,10 +18,10 @@ mod tcp;
 
 use self::hal::HalImpl;
 use virtio_drivers::{
-    device::{blk::VirtIOBlk, gpu::VirtIOGpu, net::VirtIONet},
+    device::{blk::VirtIOBlk, gpu::VirtIOGpu, rng::VirtIORng},
     transport::{
         pci::{
-            bus::{BarInfo, Cam, Command, DeviceFunction, PciRoot},
+            bus::{BarInfo, Cam, Command, ConfigurationAccess, DeviceFunction, MmioCam, PciRoot},
             virtio_device_type, PciTransport,
         },
         DeviceType, Transport,
@@ -35,7 +35,6 @@ use virtio_drivers::{
 /// TODO: get it from ACPI MCFG table.
 const MMCONFIG_BASE: usize = 0xB000_0000;
 
-const NET_BUFFER_LEN: usize = 2048;
 const NET_QUEUE_SIZE: usize = 16;
 
 fn system_off() -> ! {
@@ -67,8 +66,19 @@ fn virtio_device(transport: impl Transport) {
         DeviceType::Block => virtio_blk(transport),
         DeviceType::GPU => virtio_gpu(transport),
         DeviceType::Network => virtio_net(transport),
+        DeviceType::EntropySource => virtio_rng(transport),
         t => warn!("Unrecognized virtio device: {:?}", t),
     }
+}
+
+fn virtio_rng<T: Transport>(transport: T) {
+    let mut bytes = [0u8; 8];
+    let mut rng = VirtIORng::<HalImpl, T>::new(transport).expect("failed to create rng driver");
+    let len = rng
+        .request_entropy(&mut bytes)
+        .expect("failed to receive entropy");
+    info!("received {len} random bytes: {:?}", &bytes[..len]);
+    info!("virtio-rng test finished");
 }
 
 fn virtio_blk<T: Transport>(transport: T) {
@@ -117,37 +127,41 @@ fn virtio_gpu<T: Transport>(transport: T) {
 }
 
 fn virtio_net<T: Transport>(transport: T) {
-    let net = VirtIONet::<HalImpl, T, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_LEN)
-        .expect("failed to create net driver");
-    info!("MAC address: {:02x?}", net.mac_address());
-
     #[cfg(not(feature = "tcp"))]
     {
-        let mut net = net;
-        loop {
-            match net.receive() {
-                Ok(buf) => {
-                    info!("RECV {} bytes: {:02x?}", buf.packet_len(), buf.packet());
-                    let tx_buf = virtio_drivers::device::net::TxBuffer::from(buf.packet());
-                    net.send(tx_buf).expect("failed to send");
-                    net.recycle_rx_buffer(buf).unwrap();
-                    break;
-                }
-                Err(virtio_drivers::Error::NotReady) => continue,
-                Err(err) => panic!("failed to recv: {:?}", err),
-            }
-        }
+        let mut net =
+            virtio_drivers::device::net::VirtIONetRaw::<HalImpl, T, NET_QUEUE_SIZE>::new(transport)
+                .expect("failed to create net driver");
+        info!("MAC address: {:02x?}", net.mac_address());
+
+        let mut buf = [0u8; 2048];
+        let (hdr_len, pkt_len) = net.receive_wait(&mut buf).expect("failed to recv");
+        info!(
+            "recv {} bytes: {:02x?}",
+            pkt_len,
+            &buf[hdr_len..hdr_len + pkt_len]
+        );
+        net.send(&buf[..hdr_len + pkt_len]).expect("failed to send");
         info!("virtio-net test finished");
     }
 
     #[cfg(feature = "tcp")]
-    tcp::test_echo_server(net);
+    {
+        const NET_BUFFER_LEN: usize = 2048;
+        let net = virtio_drivers::device::net::VirtIONet::<HalImpl, T, NET_QUEUE_SIZE>::new(
+            transport,
+            NET_BUFFER_LEN,
+        )
+        .expect("failed to create net driver");
+        info!("MAC address: {:02x?}", net.mac_address());
+        tcp::test_echo_server(net);
+    }
 }
 
 fn enumerate_pci(mmconfig_base: *mut u8) {
     info!("mmconfig_base = {:#x}", mmconfig_base as usize);
 
-    let mut pci_root = unsafe { PciRoot::new(mmconfig_base, Cam::Ecam) };
+    let mut pci_root = PciRoot::new(unsafe { MmioCam::new(mmconfig_base, Cam::Ecam) });
     for (device_function, info) in pci_root.enumerate_bus(0) {
         let (status, command) = pci_root.get_status_command(device_function);
         info!(
@@ -165,7 +179,7 @@ fn enumerate_pci(mmconfig_base: *mut u8) {
             dump_bar_contents(&mut pci_root, device_function, 4);
 
             let mut transport =
-                PciTransport::new::<HalImpl>(&mut pci_root, device_function).unwrap();
+                PciTransport::new::<HalImpl, _>(&mut pci_root, device_function).unwrap();
             info!(
                 "Detected virtio PCI device with device type {:?}, features {:#018x}",
                 transport.device_type(),
@@ -176,10 +190,14 @@ fn enumerate_pci(mmconfig_base: *mut u8) {
     }
 }
 
-fn dump_bar_contents(root: &mut PciRoot, device_function: DeviceFunction, bar_index: u8) {
+fn dump_bar_contents(
+    root: &mut PciRoot<impl ConfigurationAccess>,
+    device_function: DeviceFunction,
+    bar_index: u8,
+) {
     let bar_info = root.bar_info(device_function, bar_index).unwrap();
     trace!("Dumping bar {}: {:#x?}", bar_index, bar_info);
-    if let BarInfo::Memory { address, size, .. } = bar_info {
+    if let Some(BarInfo::Memory { address, size, .. }) = bar_info {
         let start = address as *const u8;
         unsafe {
             let mut buf = [0u8; 32];

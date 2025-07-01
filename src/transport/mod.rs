@@ -4,11 +4,20 @@
 pub mod fake;
 pub mod mmio;
 pub mod pci;
+mod some;
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
 
 use crate::{PhysAddr, Result, PAGE_SIZE};
 use bitflags::{bitflags, Flags};
-use core::{fmt::Debug, ops::BitAnd, ptr::NonNull};
+use core::{
+    fmt::{self, Debug, Formatter},
+    ops::BitAnd,
+};
 use log::debug;
+pub use some::SomeTransport;
+use thiserror::Error;
+use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 /// A VirtIO transport layer.
 pub trait Transport {
@@ -98,14 +107,48 @@ pub trait Transport {
         );
     }
 
-    /// Gets the pointer to the config space.
-    fn config_space<T: 'static>(&self) -> Result<NonNull<T>>;
+    /// Reads the configuration space generation.
+    fn read_config_generation(&self) -> u32;
+
+    /// Reads a value from the device config space.
+    fn read_config_space<T: FromBytes + IntoBytes>(&self, offset: usize) -> Result<T>;
+
+    /// Writes a value to the device config space.
+    fn write_config_space<T: IntoBytes + Immutable>(
+        &mut self,
+        offset: usize,
+        value: T,
+    ) -> Result<()>;
+
+    /// Safely reads multiple fields from config space by ensuring that the config generation is the
+    /// same before and after all reads, and retrying if not.
+    fn read_consistent<T>(&self, f: impl Fn() -> Result<T>) -> Result<T> {
+        loop {
+            let before = self.read_config_generation();
+            let result = f();
+            let after = self.read_config_generation();
+            if before == after {
+                break result;
+            }
+        }
+    }
+}
+
+/// The device status field. Writing 0 into this field resets the device.
+#[derive(Copy, Clone, Default, Eq, FromBytes, Immutable, IntoBytes, PartialEq)]
+pub struct DeviceStatus(u32);
+
+impl Debug for DeviceStatus {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "DeviceStatus(")?;
+        bitflags::parser::to_writer(self, &mut *f)?;
+        write!(f, ")")?;
+        Ok(())
+    }
 }
 
 bitflags! {
-    /// The device status field. Writing 0 into this field resets the device.
-    #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
-    pub struct DeviceStatus: u32 {
+    impl DeviceStatus: u32 {
         /// Indicates that the guest OS has found the device and recognized it
         /// as a valid virtio device.
         const ACKNOWLEDGE = 1;
@@ -137,7 +180,6 @@ bitflags! {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[allow(missing_docs)]
 pub enum DeviceType {
-    Invalid = 0,
     Network = 1,
     Block = 2,
     Console = 3,
@@ -160,46 +202,76 @@ pub enum DeviceType {
     Pstore = 22,
     IOMMU = 23,
     Memory = 24,
+    Sound = 25,
 }
 
-impl From<u32> for DeviceType {
-    fn from(virtio_device_id: u32) -> Self {
+/// Errors converting a number to a virtio device type.
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
+pub enum DeviceTypeError {
+    /// Invalid or unknown virtio device type.
+    #[error("Invalid or unknown virtio device type {0}")]
+    InvalidDeviceType(u32),
+}
+
+impl TryFrom<u32> for DeviceType {
+    type Error = DeviceTypeError;
+
+    fn try_from(virtio_device_id: u32) -> core::result::Result<Self, Self::Error> {
         match virtio_device_id {
-            1 => DeviceType::Network,
-            2 => DeviceType::Block,
-            3 => DeviceType::Console,
-            4 => DeviceType::EntropySource,
-            5 => DeviceType::MemoryBalloon,
-            6 => DeviceType::IoMemory,
-            7 => DeviceType::Rpmsg,
-            8 => DeviceType::ScsiHost,
-            9 => DeviceType::_9P,
-            10 => DeviceType::Mac80211,
-            11 => DeviceType::RprocSerial,
-            12 => DeviceType::VirtioCAIF,
-            13 => DeviceType::MemoryBalloon,
-            16 => DeviceType::GPU,
-            17 => DeviceType::Timer,
-            18 => DeviceType::Input,
-            19 => DeviceType::Socket,
-            20 => DeviceType::Crypto,
-            21 => DeviceType::SignalDistributionModule,
-            22 => DeviceType::Pstore,
-            23 => DeviceType::IOMMU,
-            24 => DeviceType::Memory,
-            _ => DeviceType::Invalid,
+            1 => Ok(DeviceType::Network),
+            2 => Ok(DeviceType::Block),
+            3 => Ok(DeviceType::Console),
+            4 => Ok(DeviceType::EntropySource),
+            5 => Ok(DeviceType::MemoryBalloon),
+            6 => Ok(DeviceType::IoMemory),
+            7 => Ok(DeviceType::Rpmsg),
+            8 => Ok(DeviceType::ScsiHost),
+            9 => Ok(DeviceType::_9P),
+            10 => Ok(DeviceType::Mac80211),
+            11 => Ok(DeviceType::RprocSerial),
+            12 => Ok(DeviceType::VirtioCAIF),
+            13 => Ok(DeviceType::MemoryBalloon),
+            16 => Ok(DeviceType::GPU),
+            17 => Ok(DeviceType::Timer),
+            18 => Ok(DeviceType::Input),
+            19 => Ok(DeviceType::Socket),
+            20 => Ok(DeviceType::Crypto),
+            21 => Ok(DeviceType::SignalDistributionModule),
+            22 => Ok(DeviceType::Pstore),
+            23 => Ok(DeviceType::IOMMU),
+            24 => Ok(DeviceType::Memory),
+            25 => Ok(DeviceType::Sound),
+            _ => Err(DeviceTypeError::InvalidDeviceType(virtio_device_id)),
         }
     }
 }
 
-impl From<u16> for DeviceType {
-    fn from(virtio_device_id: u16) -> Self {
-        u32::from(virtio_device_id).into()
+impl TryFrom<u16> for DeviceType {
+    type Error = DeviceTypeError;
+
+    fn try_from(virtio_device_id: u16) -> core::result::Result<Self, Self::Error> {
+        u32::from(virtio_device_id).try_into()
     }
 }
 
-impl From<u8> for DeviceType {
-    fn from(virtio_device_id: u8) -> Self {
-        u32::from(virtio_device_id).into()
+impl TryFrom<u8> for DeviceType {
+    type Error = DeviceTypeError;
+
+    fn try_from(virtio_device_id: u8) -> core::result::Result<Self, Self::Error> {
+        u32::from(virtio_device_id).try_into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_device_status() {
+        let status = DeviceStatus::from_bits_retain(0x23);
+        assert_eq!(
+            format!("{:?}", status),
+            "DeviceStatus(ACKNOWLEDGE | DRIVER | 0x20)"
+        );
     }
 }

@@ -4,7 +4,7 @@ mode := release
 kernel := target/$(target)/$(mode)/riscv
 img := target/$(target)/$(mode)/img
 
-tcp ?= off
+tcp ?= on
 
 sysroot := $(shell rustc --print sysroot)
 objdump := $(shell find $(sysroot) -name llvm-objdump) --arch-name=$(arch)
@@ -55,10 +55,13 @@ qemu-legacy: kernel $(img)
 		-kernel $(kernel) \
 		-drive file=$(img),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0 \
+		-device virtio-rng-device \
 		-device virtio-gpu-device \
 		-device virtio-mouse-device \
 		-device virtio-net-device,netdev=net0 \
-		-netdev user,id=net0,hostfwd=tcp::5555-:5555
+		-netdev user,id=net0,hostfwd=tcp::5555-:5555\
+		-device virtio-sound-device,audiodev=audio0 \
+		-audiodev alsa,id=audio0
 
 qemu: kernel $(img)
 # Wait a few seconds, then try to open a connection to the VM so it can test its networking.
@@ -72,11 +75,13 @@ qemu: kernel $(img)
 		-global virtio-mmio.force-legacy=false \
 		-drive file=$(img),if=none,format=raw,id=x0 \
 		-device virtio-blk-device,drive=x0 \
+		-device virtio-rng-device \
 		-device virtio-gpu-device \
 		-device virtio-mouse-device \
 		-device virtio-net-device,netdev=net0 \
-		-netdev user,id=net0,hostfwd=tcp::5555-:5555
-
+		-netdev user,id=net0,hostfwd=tcp::5555-:5555\
+		-device virtio-sound-device,audiodev=audio0 \
+		-audiodev alsa,id=audio0
 
 $(img):
 	dd if=/dev/zero of=$@ bs=512 count=32

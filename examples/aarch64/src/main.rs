@@ -7,29 +7,38 @@ mod exceptions;
 mod hal;
 mod logger;
 #[cfg(platform = "qemu")]
-mod pl011;
-#[cfg(platform = "qemu")]
-use pl011 as uart;
+use arm_pl011_uart as uart;
 #[cfg(platform = "crosvm")]
 mod uart8250;
 #[cfg(platform = "crosvm")]
 use uart8250 as uart;
 
-use buddy_system_allocator::LockedHeap;
+use aarch64_paging::paging::Attributes;
+use aarch64_rt::{entry, initial_pagetable, InitialPagetable};
+#[cfg(platform = "qemu")]
+use arm_pl011_uart::{DataBits, LineConfig, PL011Registers, Parity, StopBits};
+use buddy_system_allocator::{Heap, LockedHeap};
 use core::{
     mem::size_of,
     panic::PanicInfo,
     ptr::{self, NonNull},
 };
-use fdt::{node::FdtNode, standard_nodes::Compatible, Fdt};
+use flat_device_tree::{node::FdtNode, standard_nodes::Compatible, Fdt};
 use hal::HalImpl;
 use log::{debug, error, info, trace, warn, LevelFilter};
+#[cfg(platform = "crosvm")]
+use safe_mmio::fields::WriteOnly;
+use safe_mmio::UniqueMmioPointer;
 use smccc::{psci::system_off, Hvc};
+use spin::mutex::{SpinMutex, SpinMutexGuard};
+use uart::Uart;
 use virtio_drivers::{
     device::{
         blk::VirtIOBlk,
         console::VirtIOConsole,
         gpu::VirtIOGpu,
+        net::VirtIONetRaw,
+        rng::VirtIORng,
         socket::{
             VirtIOSocket, VsockAddr, VsockConnectionManager, VsockEventType, VMADDR_CID_HOST,
         },
@@ -37,7 +46,10 @@ use virtio_drivers::{
     transport::{
         mmio::{MmioTransport, VirtIOHeader},
         pci::{
-            bus::{BarInfo, Cam, Command, DeviceFunction, MemoryBarType, PciRoot},
+            bus::{
+                BarInfo, Cam, Command, ConfigurationAccess, DeviceFunction, MemoryBarType, MmioCam,
+                PciRoot,
+            },
             virtio_device_type, PciTransport,
         },
         DeviceType, Transport,
@@ -46,33 +58,85 @@ use virtio_drivers::{
 
 /// Base memory-mapped address of the primary PL011 UART device.
 #[cfg(platform = "qemu")]
-pub const UART_BASE_ADDRESS: usize = 0x900_0000;
+pub const UART_BASE_ADDRESS: *mut PL011Registers = 0x900_0000 as _;
 
 /// The base address of the first 8250 UART.
 #[cfg(platform = "crosvm")]
-pub const UART_BASE_ADDRESS: usize = 0x3f8;
+pub const UART_BASE_ADDRESS: *mut WriteOnly<u8> = 0x3f8 as _;
 
 #[global_allocator]
 static HEAP_ALLOCATOR: LockedHeap<32> = LockedHeap::new();
 
-static mut HEAP: [u8; 0x1000000] = [0; 0x1000000];
+static HEAP: SpinMutex<[u8; 0x1000000]> = SpinMutex::new([0; 0x1000000]);
 
-#[no_mangle]
-extern "C" fn main(x0: u64, x1: u64, x2: u64, x3: u64) {
-    logger::init(LevelFilter::Debug).unwrap();
+/// Attributes to use for device memory in the initial identity map.
+const DEVICE_ATTRIBUTES: Attributes = Attributes::VALID
+    .union(Attributes::ATTRIBUTE_INDEX_0)
+    .union(Attributes::ACCESSED)
+    .union(Attributes::UXN);
+
+/// Attributes to use for normal memory in the initial identity map.
+const MEMORY_ATTRIBUTES: Attributes = Attributes::VALID
+    .union(Attributes::ATTRIBUTE_INDEX_1)
+    .union(Attributes::INNER_SHAREABLE)
+    .union(Attributes::ACCESSED)
+    .union(Attributes::NON_GLOBAL);
+
+#[cfg(platform = "qemu")]
+initial_pagetable!({
+    let mut idmap = [0; 512];
+    // 1 GiB of device memory.
+    idmap[0] = DEVICE_ATTRIBUTES.bits();
+    // 1 GiB of normal memory.
+    idmap[1] = MEMORY_ATTRIBUTES.bits() | 0x40000000;
+    // Another 1 GiB of device memory starting at 256 GiB.
+    idmap[256] = DEVICE_ATTRIBUTES.bits() | 0x4000000000;
+    InitialPagetable(idmap)
+});
+
+#[cfg(platform = "crosvm")]
+initial_pagetable!({
+    let mut idmap = [0; 512];
+    // 1 GiB of device memory.
+    idmap[0] = DEVICE_ATTRIBUTES.bits();
+    // Another 1 GiB of device memory.
+    idmap[1] = DEVICE_ATTRIBUTES.bits() | 0x40000000;
+    // 1 GiB of normal memory.
+    idmap[2] = MEMORY_ATTRIBUTES.bits() | 0x80000000;
+    InitialPagetable(idmap)
+});
+
+entry!(main);
+fn main(x0: u64, x1: u64, x2: u64, x3: u64) -> ! {
+    // Safe because UART_BASE_ADDRESS is the base of the MMIO region for a UART and is mapped as
+    // device memory.
+    #[cfg_attr(platform = "crosvm", allow(unused_mut))]
+    let mut uart =
+        Uart::new(unsafe { UniqueMmioPointer::new(NonNull::new(UART_BASE_ADDRESS).unwrap()) });
+    #[cfg(platform = "qemu")]
+    uart.enable(
+        LineConfig {
+            data_bits: DataBits::Bits8,
+            parity: Parity::None,
+            stop_bits: StopBits::One,
+        },
+        115200,
+        50000000,
+    )
+    .unwrap();
+    logger::init(uart, LevelFilter::Debug).unwrap();
+
     info!("virtio-drivers example started.");
     debug!(
         "x0={:#018x}, x1={:#018x}, x2={:#018x}, x3={:#018x}",
         x0, x1, x2, x3
     );
 
-    // Safe because `HEAP` is only used here and `entry` is only called once.
-    unsafe {
-        // Give the allocator some memory to allocate.
-        HEAP_ALLOCATOR
-            .lock()
-            .init(HEAP.as_mut_ptr() as usize, HEAP.len());
-    }
+    // Give the allocator some memory to allocate.
+    add_to_heap(
+        &mut HEAP_ALLOCATOR.lock(),
+        SpinMutexGuard::leak(HEAP.try_lock().unwrap()).as_mut_slice(),
+    );
 
     info!("Loading FDT from {:#018x}", x0);
     // Safe because the pointer is a valid pointer to unaliased memory.
@@ -85,27 +149,23 @@ extern "C" fn main(x0: u64, x1: u64, x2: u64, x3: u64) {
             node.name,
             node.compatible().map(Compatible::first),
         );
-        if let Some(reg) = node.reg() {
-            for range in reg {
-                trace!(
-                    "  {:#018x?}, length {:?}",
-                    range.starting_address,
-                    range.size
-                );
-            }
+        for range in node.reg() {
+            trace!(
+                "  {:#018x?}, length {:?}",
+                range.starting_address,
+                range.size
+            );
         }
 
         // Check whether it is a VirtIO MMIO device.
-        if let (Some(compatible), Some(region)) =
-            (node.compatible(), node.reg().and_then(|mut reg| reg.next()))
-        {
+        if let (Some(compatible), Some(region)) = (node.compatible(), node.reg().next()) {
             if compatible.all().any(|s| s == "virtio,mmio")
                 && region.size.unwrap_or(0) > size_of::<VirtIOHeader>()
             {
                 debug!("Found VirtIO MMIO device at {:?}", region);
 
                 let header = NonNull::new(region.starting_address as *mut VirtIOHeader).unwrap();
-                match unsafe { MmioTransport::new(header) } {
+                match unsafe { MmioTransport::new(header, region.size.unwrap()) } {
                     Err(e) => warn!("Error creating VirtIO MMIO transport: {}", e),
                     Ok(transport) => {
                         info!(
@@ -131,20 +191,41 @@ extern "C" fn main(x0: u64, x1: u64, x2: u64, x3: u64) {
     }
 
     system_off::<Hvc>().unwrap();
+    panic!("system_off returned");
+}
+
+/// Adds the given memory range to the given heap.
+fn add_to_heap<const ORDER: usize>(heap: &mut Heap<ORDER>, range: &'static mut [u8]) {
+    // SAFETY: The range we pass is valid because it comes from a mutable static reference, which it
+    // effectively takes ownership of.
+    unsafe {
+        heap.init(range.as_mut_ptr() as usize, range.len());
+    }
 }
 
 fn virtio_device(transport: impl Transport) {
     match transport.device_type() {
         DeviceType::Block => virtio_blk(transport),
         DeviceType::GPU => virtio_gpu(transport),
-        // DeviceType::Network => virtio_net(transport), // currently is unsupported without alloc
+        DeviceType::Network => virtio_net(transport),
         DeviceType::Console => virtio_console(transport),
         DeviceType::Socket => match virtio_socket(transport) {
             Ok(()) => info!("virtio-socket test finished successfully"),
             Err(e) => error!("virtio-socket test finished with error '{e:?}'"),
         },
+        DeviceType::EntropySource => virtio_rng(transport),
         t => warn!("Unrecognized virtio device: {:?}", t),
     }
+}
+
+fn virtio_rng<T: Transport>(transport: T) {
+    let mut bytes = [0u8; 8];
+    let mut rng = VirtIORng::<HalImpl, T>::new(transport).expect("failed to create rng driver");
+    let len = rng
+        .request_entropy(&mut bytes)
+        .expect("failed to receive entropy");
+    info!("received {len} random bytes: {:?}", &bytes[..len]);
+    info!("virtio-rng test finished");
 }
 
 fn virtio_blk<T: Transport>(transport: T) {
@@ -192,11 +273,26 @@ fn virtio_gpu<T: Transport>(transport: T) {
     info!("virtio-gpu test finished");
 }
 
+fn virtio_net<T: Transport>(transport: T) {
+    let mut net =
+        VirtIONetRaw::<HalImpl, T, 16>::new(transport).expect("failed to create net driver");
+    let mut buf = [0u8; 2048];
+    let (hdr_len, pkt_len) = net.receive_wait(&mut buf).expect("failed to recv");
+    info!(
+        "recv {} bytes: {:02x?}",
+        pkt_len,
+        &buf[hdr_len..hdr_len + pkt_len]
+    );
+    net.send(&buf[..hdr_len + pkt_len]).expect("failed to send");
+    info!("virtio-net test finished");
+}
+
 fn virtio_console<T: Transport>(transport: T) {
     let mut console =
         VirtIOConsole::<HalImpl, T>::new(transport).expect("Failed to create console driver");
-    let info = console.info();
-    info!("VirtIO console {}x{}", info.rows, info.columns);
+    if let Some(size) = console.size().unwrap() {
+        info!("VirtIO console {}", size);
+    }
     for &c in b"Hello world on console!\n" {
         console.send(c).expect("Failed to send character");
     }
@@ -256,8 +352,8 @@ enum PciRangeType {
     Memory64,
 }
 
-impl From<u8> for PciRangeType {
-    fn from(value: u8) -> Self {
+impl From<u32> for PciRangeType {
+    fn from(value: u32) -> Self {
         match value {
             0 => Self::ConfigurationSpace,
             1 => Self::IoSpace,
@@ -269,7 +365,7 @@ impl From<u8> for PciRangeType {
 }
 
 fn enumerate_pci(pci_node: FdtNode, cam: Cam) {
-    let reg = pci_node.reg().expect("PCI node missing reg property.");
+    let reg = pci_node.reg();
     let mut allocator = PciMemory32Allocator::for_pci_ranges(&pci_node);
 
     for region in reg {
@@ -279,8 +375,9 @@ fn enumerate_pci(pci_node: FdtNode, cam: Cam) {
             region.starting_address as usize + region.size.unwrap()
         );
         assert_eq!(region.size.unwrap(), cam.size() as usize);
-        // Safe because we know the pointer is to a valid MMIO region.
-        let mut pci_root = unsafe { PciRoot::new(region.starting_address as *mut u8, cam) };
+        // SAFETY: We know the pointer is to a valid MMIO region.
+        let mut pci_root =
+            PciRoot::new(unsafe { MmioCam::new(region.starting_address as *mut u8, cam) });
         for (device_function, info) in pci_root.enumerate_bus(0) {
             let (status, command) = pci_root.get_status_command(device_function);
             info!(
@@ -292,7 +389,7 @@ fn enumerate_pci(pci_node: FdtNode, cam: Cam) {
                 allocate_bars(&mut pci_root, device_function, &mut allocator);
                 dump_bar_contents(&mut pci_root, device_function, 4);
                 let mut transport =
-                    PciTransport::new::<HalImpl>(&mut pci_root, device_function).unwrap();
+                    PciTransport::new::<HalImpl, _>(&mut pci_root, device_function).unwrap();
                 info!(
                     "Detected virtio PCI device with device type {:?}, features {:#018x}",
                     transport.device_type(),
@@ -313,18 +410,14 @@ struct PciMemory32Allocator {
 impl PciMemory32Allocator {
     /// Creates a new allocator based on the ranges property of the given PCI node.
     pub fn for_pci_ranges(pci_node: &FdtNode) -> Self {
-        let ranges = pci_node
-            .property("ranges")
-            .expect("PCI node missing ranges property.");
         let mut memory_32_address = 0;
         let mut memory_32_size = 0;
-        for i in 0..ranges.value.len() / 28 {
-            let range = &ranges.value[i * 28..(i + 1) * 28];
-            let prefetchable = range[0] & 0x80 != 0;
-            let range_type = PciRangeType::from(range[0] & 0x3);
-            let bus_address = u64::from_be_bytes(range[4..12].try_into().unwrap());
-            let cpu_physical = u64::from_be_bytes(range[12..20].try_into().unwrap());
-            let size = u64::from_be_bytes(range[20..28].try_into().unwrap());
+        for range in pci_node.ranges() {
+            let prefetchable = range.child_bus_address_hi & 0x4000_0000 != 0;
+            let range_type = PciRangeType::from((range.child_bus_address_hi & 0x0300_0000) >> 24);
+            let bus_address = range.child_bus_address as u64;
+            let cpu_physical = range.parent_bus_address as u64;
+            let size = range.size as u64;
             info!(
                 "range: {:?} {}prefetchable bus address: {:#018x} host physical address: {:#018x} size: {:#018x}",
                 range_type,
@@ -371,10 +464,14 @@ const fn align_up(value: u32, alignment: u32) -> u32 {
     ((value - 1) | (alignment - 1)) + 1
 }
 
-fn dump_bar_contents(root: &mut PciRoot, device_function: DeviceFunction, bar_index: u8) {
+fn dump_bar_contents(
+    root: &mut PciRoot<impl ConfigurationAccess>,
+    device_function: DeviceFunction,
+    bar_index: u8,
+) {
     let bar_info = root.bar_info(device_function, bar_index).unwrap();
     trace!("Dumping bar {}: {:#x?}", bar_index, bar_info);
-    if let BarInfo::Memory { address, size, .. } = bar_info {
+    if let Some(BarInfo::Memory { address, size, .. }) = bar_info {
         let start = address as *const u8;
         unsafe {
             let mut buf = [0u8; 32];
@@ -392,42 +489,43 @@ fn dump_bar_contents(root: &mut PciRoot, device_function: DeviceFunction, bar_in
 
 /// Allocates appropriately-sized memory regions and assigns them to the device's BARs.
 fn allocate_bars(
-    root: &mut PciRoot,
+    root: &mut PciRoot<impl ConfigurationAccess>,
     device_function: DeviceFunction,
     allocator: &mut PciMemory32Allocator,
 ) {
-    let mut bar_index = 0;
-    while bar_index < 6 {
-        let info = root.bar_info(device_function, bar_index).unwrap();
+    for (bar_index, info) in root.bars(device_function).unwrap().into_iter().enumerate() {
+        let Some(info) = info else { continue };
         debug!("BAR {}: {}", bar_index, info);
         // Ignore I/O bars, as they aren't required for the VirtIO driver.
         if let BarInfo::Memory {
             address_type, size, ..
         } = info
         {
+            // For now, only attempt to allocate 32-bit memory regions.
+            if size > u32::MAX.into() {
+                warn!("Skipping BAR {} with size {:#x}", bar_index, size);
+                continue;
+            }
+            let size = size as u32;
+
             match address_type {
                 MemoryBarType::Width32 => {
                     if size > 0 {
                         let address = allocator.allocate_memory_32(size);
                         debug!("Allocated address {:#010x}", address);
-                        root.set_bar_32(device_function, bar_index, address);
+                        root.set_bar_32(device_function, bar_index as u8, address);
                     }
                 }
                 MemoryBarType::Width64 => {
                     if size > 0 {
                         let address = allocator.allocate_memory_32(size);
                         debug!("Allocated address {:#010x}", address);
-                        root.set_bar_64(device_function, bar_index, address.into());
+                        root.set_bar_64(device_function, bar_index as u8, address.into());
                     }
                 }
 
                 _ => panic!("Memory BAR address type {:?} not supported.", address_type),
             }
-        }
-
-        bar_index += 1;
-        if info.takes_two_entries() {
-            bar_index += 1;
         }
     }
 

@@ -1,6 +1,6 @@
 //! Log implementation using the UART.
 
-use crate::{uart::Uart, UART_BASE_ADDRESS};
+use crate::uart::Uart;
 use core::fmt::Write;
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 use spin::mutex::SpinMutex;
@@ -10,14 +10,11 @@ static LOGGER: Logger = Logger {
 };
 
 struct Logger {
-    uart: SpinMutex<Option<Uart>>,
+    uart: SpinMutex<Option<Uart<'static>>>,
 }
 
 /// Initialises UART logger.
-pub fn init(max_level: LevelFilter) -> Result<(), SetLoggerError> {
-    // Safe because BASE_ADDRESS is the base of the MMIO region for a UART and is mapped as device
-    // memory.
-    let uart = unsafe { Uart::new(UART_BASE_ADDRESS) };
+pub fn init(uart: Uart<'static>, max_level: LevelFilter) -> Result<(), SetLoggerError> {
     LOGGER.uart.lock().replace(uart);
 
     log::set_logger(&LOGGER)?;
