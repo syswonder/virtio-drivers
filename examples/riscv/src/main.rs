@@ -10,10 +10,16 @@ extern crate opensbi_rt;
 
 use alloc::vec;
 use core::ptr::NonNull;
-use fdt::{node::FdtNode, standard_nodes::Compatible, Fdt};
+use flat_device_tree::{node::FdtNode, standard_nodes::Compatible, Fdt};
 use log::LevelFilter;
 use virtio_drivers::{
-    device::{blk::VirtIOBlk, gpu::VirtIOGpu, input::VirtIOInput, net::VirtIONet},
+    device::{
+        blk::VirtIOBlk,
+        gpu::VirtIOGpu,
+        input::VirtIOInput,
+        rng::VirtIORng,
+        sound::{PcmFormat, PcmRate, VirtIOSound},
+    },
     transport::{
         mmio::{MmioTransport, VirtIOHeader},
         DeviceType, Transport,
@@ -26,7 +32,6 @@ mod virtio_impl;
 #[cfg(feature = "tcp")]
 mod tcp;
 
-const NET_BUFFER_LEN: usize = 2048;
 const NET_QUEUE_SIZE: usize = 16;
 
 #[no_mangle]
@@ -54,7 +59,7 @@ fn walk_dt(fdt: Fdt) {
 }
 
 fn virtio_probe(node: FdtNode) {
-    if let Some(reg) = node.reg().and_then(|mut reg| reg.next()) {
+    if let Some(reg) = node.reg().next() {
         let paddr = reg.starting_address as usize;
         let size = reg.size.unwrap();
         let vaddr = paddr;
@@ -65,7 +70,7 @@ fn virtio_probe(node: FdtNode) {
             node.compatible().map(Compatible::first),
         );
         let header = NonNull::new(vaddr as *mut VirtIOHeader).unwrap();
-        match unsafe { MmioTransport::new(header) } {
+        match unsafe { MmioTransport::new(header, size) } {
             Err(e) => warn!("Error creating VirtIO MMIO transport: {}", e),
             Ok(transport) => {
                 info!(
@@ -86,8 +91,20 @@ fn virtio_device(transport: impl Transport) {
         DeviceType::GPU => virtio_gpu(transport),
         DeviceType::Input => virtio_input(transport),
         DeviceType::Network => virtio_net(transport),
+        DeviceType::Sound => virtio_sound(transport),
+        DeviceType::EntropySource => virtio_rng(transport),
         t => warn!("Unrecognized virtio device: {:?}", t),
     }
+}
+
+fn virtio_rng<T: Transport>(transport: T) {
+    let mut bytes = [0u8; 8];
+    let mut rng = VirtIORng::<HalImpl, T>::new(transport).expect("failed to create rng driver");
+    let len = rng
+        .request_entropy(&mut bytes)
+        .expect("failed to receive entropy");
+    info!("received {len} random bytes: {:?}", &bytes[..len]);
+    info!("virtio-rng test finished");
 }
 
 fn virtio_blk<T: Transport>(transport: T) {
@@ -146,29 +163,91 @@ fn virtio_input<T: Transport>(transport: T) {
 }
 
 fn virtio_net<T: Transport>(transport: T) {
-    let net = VirtIONet::<HalImpl, T, NET_QUEUE_SIZE>::new(transport, NET_BUFFER_LEN)
-        .expect("failed to create net driver");
-    info!("MAC address: {:02x?}", net.mac_address());
-
     #[cfg(not(feature = "tcp"))]
     {
-        let mut net = net;
-        loop {
-            match net.receive() {
-                Ok(buf) => {
-                    info!("RECV {} bytes: {:02x?}", buf.packet_len(), buf.packet());
-                    let tx_buf = virtio_drivers::device::net::TxBuffer::from(buf.packet());
-                    net.send(tx_buf).expect("failed to send");
-                    net.recycle_rx_buffer(buf).unwrap();
-                    break;
-                }
-                Err(virtio_drivers::Error::NotReady) => continue,
-                Err(err) => panic!("failed to recv: {:?}", err),
-            }
-        }
+        let mut net =
+            virtio_drivers::device::net::VirtIONetRaw::<HalImpl, T, NET_QUEUE_SIZE>::new(transport)
+                .expect("failed to create net driver");
+        info!("MAC address: {:02x?}", net.mac_address());
+
+        let mut buf = [0u8; 2048];
+        let (hdr_len, pkt_len) = net.receive_wait(&mut buf).expect("failed to recv");
+        info!(
+            "recv {} bytes: {:02x?}",
+            pkt_len,
+            &buf[hdr_len..hdr_len + pkt_len]
+        );
+        net.send(&buf[..hdr_len + pkt_len]).expect("failed to send");
         info!("virtio-net test finished");
     }
 
     #[cfg(feature = "tcp")]
-    tcp::test_echo_server(net);
+    {
+        const NET_BUFFER_LEN: usize = 2048;
+        let net = virtio_drivers::device::net::VirtIONet::<HalImpl, T, NET_QUEUE_SIZE>::new(
+            transport,
+            NET_BUFFER_LEN,
+        )
+        .expect("failed to create net driver");
+        info!("MAC address: {:02x?}", net.mac_address());
+        tcp::test_echo_server(net);
+    }
+}
+
+fn virtio_sound<T: Transport>(transport: T) {
+    let mut sound =
+        VirtIOSound::<HalImpl, T>::new(transport).expect("failed to create sound driver");
+    let output_streams = sound.output_streams().unwrap();
+    if !output_streams.is_empty() {
+        let output_stream_id = *output_streams.first().unwrap();
+        let rates = sound.rates_supported(output_stream_id).unwrap();
+        let formats = sound.formats_supported(output_stream_id).unwrap();
+        let channel_range = sound.channel_range_supported(output_stream_id).unwrap();
+        let features = sound.features_supported(output_stream_id).unwrap();
+
+        let rate = if rates.contains(PcmRate::Rate44100.into()) {
+            PcmRate::Rate44100
+        } else {
+            PcmRate::Rate32000
+        };
+        let format = if formats.contains(PcmFormat::U8.into()) {
+            PcmFormat::U8
+        } else {
+            PcmFormat::U32
+        };
+        let channel = if channel_range.contains(&2) {
+            2
+        } else {
+            *channel_range.start()
+        };
+        sound
+            .pcm_set_params(
+                output_stream_id,
+                4410 * 2,
+                4410,
+                features,
+                channel,
+                format,
+                rate,
+            )
+            .expect("pcm_set_params error");
+        sound
+            .pcm_prepare(output_stream_id)
+            .expect("pcm_prepare error");
+        sound.pcm_start(output_stream_id).expect("pcm_start error");
+        let music = include_bytes!("../music_44100Hz_u8_stereo.raw");
+        info!("[sound device] music len is {} bytes.", music.len());
+        // xfer buffer
+        sound
+            .pcm_xfer(output_stream_id, &music[..])
+            .expect("pcm_xfer error");
+        sound.pcm_stop(output_stream_id).expect("pcm_stop error");
+        sound
+            .pcm_release(output_stream_id)
+            .expect("pcm_release error");
+        match sound.latest_notification() {
+            Ok(notification) => info!("{:?}", notification),
+            Err(e) => warn!("{}", e),
+        }
+    }
 }

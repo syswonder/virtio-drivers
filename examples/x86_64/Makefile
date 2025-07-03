@@ -3,8 +3,8 @@ target := x86_64-unknown-none
 mode := release
 kernel := target/$(target)/$(mode)/$(arch)
 img := target/$(target)/$(mode)/img
-accel := on
-tcp ?= off
+accel ?= on
+tcp ?= on
 
 sysroot := $(shell rustc --print sysroot)
 objdump := $(shell find $(sysroot) -name llvm-objdump) --arch-name=$(arch)
@@ -20,17 +20,13 @@ else
 	BUILD_ARGS += --no-default-features
 endif
 
-VSOCK_BUILD_ARGS =
-ifeq ($(mode), release)
-	VSOCK_BUILD_ARGS += --release
-endif
-
 QEMU_ARGS += \
 	-machine q35 \
 	-serial mon:stdio \
 	-kernel $(kernel) \
 	-device virtio-gpu-pci -vga none \
 	-device virtio-blk-pci,drive=x0 -drive file=$(img),if=none,format=raw,id=x0 \
+	-device virtio-rng-pci \
 	-device virtio-net-pci,netdev=net0 -netdev user,id=net0,hostfwd=tcp::5555-:5555
 
 ifeq ($(accel), on)

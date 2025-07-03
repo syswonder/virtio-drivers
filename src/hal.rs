@@ -16,6 +16,13 @@ pub struct Dma<H: Hal> {
     _hal: PhantomData<H>,
 }
 
+// SAFETY: DMA memory can be accessed from any thread.
+unsafe impl<H: Hal> Send for Dma<H> {}
+
+// SAFETY: `&Dma` only allows pointers and physical addresses to be returned. Any actual access to
+// the memory requires unsafe code, which is responsible for avoiding data races.
+unsafe impl<H: Hal> Sync for Dma<H> {}
+
 impl<H: Hal> Dma<H> {
     /// Allocates the given number of pages of physically contiguous memory to be used for DMA in
     /// the given direction.
@@ -55,8 +62,8 @@ impl<H: Hal> Dma<H> {
 
 impl<H: Hal> Drop for Dma<H> {
     fn drop(&mut self) {
-        // Safe because the memory was previously allocated by `dma_alloc` in `Dma::new`, not yet
-        // deallocated, and we are passing the values from then.
+        // SAFETY: The memory was previously allocated by `dma_alloc` in `Dma::new`,
+        // not yet deallocated, and we are passing the values from then.
         let err = unsafe { H::dma_dealloc(self.paddr, self.vaddr, self.pages) };
         assert_eq!(err, 0, "failed to deallocate DMA");
     }

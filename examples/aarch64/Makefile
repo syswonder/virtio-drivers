@@ -84,6 +84,7 @@ qemu: $(kernel_qemu_bin) $(img) $(vsock_server_bin)
 		-drive file=$(img),if=none,format=raw,id=x0 \
 		-device vhost-vsock-device,id=virtiosocket0,guest-cid=102 \
 		-device virtio-blk-device,drive=x0 \
+		-device virtio-rng-device \
 		-device virtio-gpu-device \
 		-device virtio-serial,id=virtio-serial0 \
 		-chardev stdio,id=char0,mux=on \
@@ -101,6 +102,7 @@ qemu-pci: $(kernel_qemu_bin) $(img)
 		-drive file=$(img),if=none,format=raw,id=x0 \
 		-device vhost-vsock-pci,id=virtiosocket0,guest-cid=103 \
 		-device virtio-blk-pci,drive=x0 \
+		-device virtio-rng-pci \
 		-device virtio-gpu-pci \
 		-device virtio-serial,id=virtio-serial0 \
 		-chardev stdio,id=char0,mux=on \
@@ -110,7 +112,7 @@ crosvm: $(kernel_crosvm_bin) $(img)
 	adb shell 'mkdir -p /data/local/tmp/virt_raw'
 	adb push $(kernel_crosvm_bin) /data/local/tmp/virt_raw/aarch64_example
 	adb push $(img) /data/local/tmp/virt_raw/disk_img
-	adb shell "/data/local/tmp/crosvm --log-level=trace --extended-status run --disable-sandbox --serial=stdout,hardware=serial,num=1 --rwdisk=/data/local/tmp/virt_raw/disk_img --bios=/data/local/tmp/virt_raw/aarch64_example"
+	adb shell "/apex/com.android.virt/bin/crosvm --log-level=info --extended-status run --disable-sandbox --serial=stdout,hardware=serial,num=1 --rwdisk=/data/local/tmp/virt_raw/disk_img --bios=/data/local/tmp/virt_raw/aarch64_example"
 
 $(img):
 	dd if=/dev/zero of=$@ bs=512 count=32

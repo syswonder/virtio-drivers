@@ -14,9 +14,9 @@
 //! use core::ptr::NonNull;
 //! use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
 //!
-//! # fn example(mmio_device_address: usize) {
+//! # fn example(mmio_device_address: usize, mmio_size: usize) {
 //! let header = NonNull::new(mmio_device_address as *mut VirtIOHeader).unwrap();
-//! let transport = unsafe { MmioTransport::new(header) }.unwrap();
+//! let transport = unsafe { MmioTransport::new(header, mmio_size) }.unwrap();
 //! # }
 //! ```
 //!
@@ -42,25 +42,26 @@
 //! ```
 
 #![cfg_attr(not(test), no_std)]
-#![deny(unused_must_use, missing_docs)]
+#![deny(unused_must_use, missing_docs, clippy::undocumented_unsafe_blocks)]
 #![allow(clippy::identity_op)]
 #![allow(dead_code)]
 
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
+mod config;
 pub mod device;
+#[cfg(feature = "embedded-io")]
+mod embedded_io;
 mod hal;
 mod queue;
 pub mod transport;
-mod volatile;
 
-use core::{
-    fmt::{self, Display, Formatter},
-    ptr::{self, NonNull},
-};
+use device::socket::SocketError;
+use thiserror::Error;
 
 pub use self::hal::{BufferDirection, Hal, PhysAddr};
+pub use safe_mmio::UniqueMmioPointer;
 
 /// The page size in bytes supported by the library (4 KiB).
 pub const PAGE_SIZE: usize = 0x1000;
@@ -69,64 +70,47 @@ pub const PAGE_SIZE: usize = 0x1000;
 pub type Result<T = ()> = core::result::Result<T, Error>;
 
 /// The error type of VirtIO drivers.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, Error, PartialEq)]
 pub enum Error {
     /// There are not enough descriptors available in the virtqueue, try again later.
+    #[error("Virtqueue is full")]
     QueueFull,
     /// The device is not ready.
+    #[error("Device not ready")]
     NotReady,
     /// The device used a different descriptor chain to the one we were expecting.
+    #[error("Device used a different descriptor chain to the one we were expecting")]
     WrongToken,
     /// The queue is already in use.
+    #[error("Virtqueue is already in use")]
     AlreadyUsed,
     /// Invalid parameter.
+    #[error("Invalid parameter")]
     InvalidParam,
-    /// Failed to alloc DMA memory.
+    /// Failed to allocate DMA memory.
+    #[error("Failed to allocate DMA memory")]
     DmaError,
-    /// I/O Error
+    /// I/O error
+    #[error("I/O error")]
     IoError,
     /// The request was not supported by the device.
+    #[error("Request not supported by device")]
     Unsupported,
     /// The config space advertised by the device is smaller than the driver expected.
+    #[error("Config space advertised by the device is smaller than expected")]
     ConfigSpaceTooSmall,
     /// The device doesn't have any config space, but the driver expects some.
+    #[error("The device doesn't have any config space, but the driver expects some")]
     ConfigSpaceMissing,
     /// Error from the socket device.
-    SocketDeviceError(device::socket::SocketError),
+    #[error("Error from the socket device: {0}")]
+    SocketDeviceError(#[from] SocketError),
 }
 
-impl Display for Error {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            Self::QueueFull => write!(f, "Virtqueue is full"),
-            Self::NotReady => write!(f, "Device not ready"),
-            Self::WrongToken => write!(
-                f,
-                "Device used a different descriptor chain to the one we were expecting"
-            ),
-            Self::AlreadyUsed => write!(f, "Virtqueue is already in use"),
-            Self::InvalidParam => write!(f, "Invalid parameter"),
-            Self::DmaError => write!(f, "Failed to allocate DMA memory"),
-            Self::IoError => write!(f, "I/O Error"),
-            Self::Unsupported => write!(f, "Request not supported by device"),
-            Self::ConfigSpaceTooSmall => write!(
-                f,
-                "Config space advertised by the device is smaller than expected"
-            ),
-            Self::ConfigSpaceMissing => {
-                write!(
-                    f,
-                    "The device doesn't have any config space, but the driver expects some"
-                )
-            }
-            Self::SocketDeviceError(e) => write!(f, "Error from the socket device: {e:?}"),
-        }
-    }
-}
-
-impl From<device::socket::SocketError> for Error {
-    fn from(e: device::socket::SocketError) -> Self {
-        Self::SocketDeviceError(e)
+#[cfg(feature = "alloc")]
+impl From<alloc::string::FromUtf8Error> for Error {
+    fn from(_value: alloc::string::FromUtf8Error) -> Self {
+        Self::IoError
     }
 }
 
@@ -137,11 +121,5 @@ fn align_up(size: usize) -> usize {
 
 /// The number of pages required to store `size` bytes, rounded up to a whole number of pages.
 fn pages(size: usize) -> usize {
-    (size + PAGE_SIZE - 1) / PAGE_SIZE
-}
-
-// TODO: Use NonNull::slice_from_raw_parts once it is stable.
-/// Creates a non-null raw slice from a non-null thin pointer and length.
-fn nonnull_slice_from_raw_parts<T>(data: NonNull<T>, len: usize) -> NonNull<[T]> {
-    NonNull::new(ptr::slice_from_raw_parts_mut(data.as_ptr(), len)).unwrap()
+    size.div_ceil(PAGE_SIZE)
 }

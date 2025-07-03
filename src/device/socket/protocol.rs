@@ -1,7 +1,7 @@
 //! This module defines the socket device protocol according to the virtio spec v1.1 5.10 Socket Device
 
 use super::error::{self, SocketError};
-use crate::volatile::ReadOnly;
+use crate::config::ReadOnly;
 use bitflags::bitflags;
 use core::{
     convert::{TryFrom, TryInto},
@@ -9,7 +9,7 @@ use core::{
 };
 use zerocopy::{
     byteorder::{LittleEndian, U16, U32, U64},
-    AsBytes, FromBytes, FromZeroes,
+    FromBytes, Immutable, IntoBytes, KnownLayout,
 };
 
 /// Well-known CID for the host.
@@ -32,6 +32,7 @@ impl From<SocketType> for U16<LittleEndian> {
 }
 
 /// VirtioVsockConfig is the vsock device configuration space.
+#[derive(FromBytes, Immutable, IntoBytes)]
 #[repr(C)]
 pub struct VirtioVsockConfig {
     /// The guest_cid field contains the guest’s context ID, which uniquely identifies
@@ -45,8 +46,8 @@ pub struct VirtioVsockConfig {
 }
 
 /// The message header for data packets sent on the tx/rx queues
-#[repr(packed)]
-#[derive(AsBytes, Clone, Copy, Debug, Eq, FromBytes, FromZeroes, PartialEq)]
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, IntoBytes, KnownLayout, PartialEq)]
 pub struct VirtioVsockHdr {
     pub src_cid: U64<LittleEndian>,
     pub dst_cid: U64<LittleEndian>,
@@ -122,7 +123,7 @@ pub struct VsockAddr {
 }
 
 /// An event sent to the event queue
-#[derive(Copy, Clone, Debug, Default, AsBytes, FromBytes, FromZeroes)]
+#[derive(Copy, Clone, Debug, Default, IntoBytes, FromBytes, Immutable, KnownLayout)]
 #[repr(C)]
 pub struct VirtioVsockEvent {
     // ID from the virtio_vsock_event_id struct in the virtio spec
@@ -212,5 +213,22 @@ bitflags! {
         const ORDER_PLATFORM        = 1 << 36;
         const SR_IOV                = 1 << 37;
         const NOTIFICATION_DATA     = 1 << 38;
+    }
+}
+
+bitflags! {
+    /// Flags sent with a shutdown request to hint that the peer won't send or receive more data.
+    #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+    pub struct StreamShutdown: u32 {
+        /// The peer will not receive any more data.
+        const RECEIVE = 1 << 0;
+        /// The peer will not send any more data.
+        const SEND = 1 << 1;
+    }
+}
+
+impl From<StreamShutdown> for U32<LittleEndian> {
+    fn from(flags: StreamShutdown) -> Self {
+        flags.bits().into()
     }
 }
